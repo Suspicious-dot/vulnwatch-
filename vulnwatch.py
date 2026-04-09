@@ -202,7 +202,9 @@ def fetch_nvd() -> list[dict]:
     vulns = []
     try:
         end   = datetime.now(timezone.utc)
-        start = end - timedelta(hours=CHECK_HOURS_BACK)
+        # NVD API max range is 120 days — cap it
+        actual_hours = min(CHECK_HOURS_BACK, 2880)
+        start = end - timedelta(hours=actual_hours)
         fmt   = "%Y-%m-%dT%H:%M:%S.000"
         url   = (
             "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -248,20 +250,71 @@ def fetch_nvd() -> list[dict]:
 
 
 def fetch_osv() -> list[dict]:
-    """OSV.dev — package-level vulns with exact version ranges."""
+    """OSV.dev — queries by specific package names for exact version range matches."""
     vulns  = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=CHECK_HOURS_BACK)
-    for eco in ["npm", "PyPI", "Go", "Maven", "RubyGems", "crates.io", "Packagist"]:
+
+    # Key packages to always check — covers most common stacks
+    PACKAGES_TO_CHECK = [
+        # npm
+        ("lodash",                "npm"),
+        ("express",               "npm"),
+        ("axios",                 "npm"),
+        ("minimist",              "npm"),
+        ("node-fetch",            "npm"),
+        ("handlebars",            "npm"),
+        ("moment",                "npm"),
+        ("jquery",                "npm"),
+        ("serialize-javascript",  "npm"),
+        ("ws",                    "npm"),
+        ("webpack",               "npm"),
+        ("semver",                "npm"),
+        ("got",                   "npm"),
+        ("tar",                   "npm"),
+        ("path-parse",            "npm"),
+        # PyPI
+        ("django",                "PyPI"),
+        ("requests",              "PyPI"),
+        ("pillow",                "PyPI"),
+        ("pyyaml",                "PyPI"),
+        ("cryptography",          "PyPI"),
+        ("urllib3",               "PyPI"),
+        ("werkzeug",              "PyPI"),
+        ("paramiko",              "PyPI"),
+        ("lxml",                  "PyPI"),
+        ("flask",                 "PyPI"),
+        ("sqlalchemy",            "PyPI"),
+        ("celery",                "PyPI"),
+        ("jinja2",                "PyPI"),
+        ("pydantic",              "PyPI"),
+        ("setuptools",            "PyPI"),
+        ("pip",                   "PyPI"),
+        ("certifi",               "PyPI"),
+        ("aiohttp",               "PyPI"),
+        ("tornado",               "PyPI"),
+        ("httpx",                 "PyPI"),
+        # Go
+        ("golang.org/x/crypto",   "Go"),
+        ("golang.org/x/net",      "Go"),
+        ("github.com/dgrijalva/jwt-go", "Go"),
+        ("github.com/gorilla/websocket","Go"),
+    ]
+
+    for pkg_name, eco in PACKAGES_TO_CHECK:
         try:
             r = requests.post(
                 "https://api.osv.dev/v1/query",
-                json={"package": {"ecosystem": eco}},
-                timeout=20
+                json={"package": {"name": pkg_name, "ecosystem": eco}},
+                timeout=15
             )
-            if r.status_code != 200: continue
+            if r.status_code != 200:
+                continue
             for v in r.json().get("vulns", []):
-                mod_dt = parse_dt(v.get("modified", "") or v.get("published", ""))
-                if mod_dt and mod_dt < cutoff: continue
+                # With big lookback window skip the date filter
+                if CHECK_HOURS_BACK < 8760:  # less than 1 year
+                    mod_dt = parse_dt(v.get("modified", "") or v.get("published", ""))
+                    if mod_dt and mod_dt < cutoff:
+                        continue
                 vid   = v.get("id", "")
                 title = v.get("summary", vid)[:200]
                 desc  = v.get("details", "")[:400]
@@ -281,20 +334,31 @@ def fetch_osv() -> list[dict]:
                         for ev in rng.get("events", []):
                             if "introduced" in ev: vers.append(f">={ev['introduced']}")
                             if "fixed"      in ev: vers.append(f"<{ev['fixed']}")
-                vulns.append({
-                    "id": vid, "title": title, "description": desc,
-                    "severity": sev, "cvss": cvss,
-                    "category": classify(title, desc),
-                    "source": "OSV.dev", "source_emoji": "📦",
-                    "url": f"https://osv.dev/vulnerability/{vid}",
-                    "published": v.get("published", ""),
-                    "affected_packages": pkgs, "affected_versions": ",".join(vers),
-                    "ecosystems": [eco.lower()],
-                })
+                if not any(v["id"] == vid for v in vulns if isinstance(v, dict)):
+                    vulns.append({
+                        "id": vid, "title": title, "description": desc,
+                        "severity": sev, "cvss": cvss,
+                        "category": classify(title, desc),
+                        "source": "OSV.dev", "source_emoji": "📦",
+                        "url": f"https://osv.dev/vulnerability/{vid}",
+                        "published": v.get("published", ""),
+                        "affected_packages": pkgs,
+                        "affected_versions": ",".join(vers),
+                        "ecosystems": [eco.lower()],
+                    })
         except Exception as e:
-            log.warning(f"OSV {eco}: {e}")
-    log.info(f"OSV: {len(vulns)} vulns")
-    return vulns
+            log.warning(f"OSV {pkg_name}: {e}")
+
+    # deduplicate by id
+    seen_ids = set()
+    deduped  = []
+    for v in vulns:
+        if v["id"] not in seen_ids:
+            seen_ids.add(v["id"])
+            deduped.append(v)
+
+    log.info(f"OSV: {len(deduped)} vulns across {len(PACKAGES_TO_CHECK)} packages")
+    return deduped
 
 
 RSS_FEEDS = [
@@ -500,9 +564,12 @@ def _requirements(c):
     out = []
     for line in c.splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or line.startswith("-"): continue
-        m = re.match(r'^([A-Za-z0-9_\-\.]+)\s*[=~><]+\s*([^\s,;]+)', line)
-        if m: out.append((m.group(1).lower(), m.group(2), "pypi"))
+        # Strip inline comments BEFORE processing
+        if "#" in line:
+            line = line[:line.index("#")].strip()
+        if not line or line.startswith("-"): continue
+        m = re.match(r'^([A-Za-z0-9_\-\.]+)\s*[=~><]+\s*([^\s,;#]+)', line)
+        if m: out.append((m.group(1).lower(), m.group(2).strip(), "pypi"))
     return out
 
 def _pipfile_lock(c):
