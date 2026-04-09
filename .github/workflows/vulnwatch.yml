@@ -1,0 +1,60 @@
+name: 🔐 VulnWatch — 24/7 Vulnerability Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # runs every 5 minutes, 24/7, forever
+  workflow_dispatch:          # allows manual trigger from GitHub UI
+
+jobs:
+  vulnwatch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # needed to save state file back to repo
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-vulnwatch
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install requests feedparser packaging python-gitlab slack-sdk lxml
+
+      - name: Pull latest state (avoid duplicates)
+        run: git pull --rebase origin main || true
+
+      - name: Run VulnWatch
+        env:
+          GITLAB_TOKEN:            ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_URL:              ${{ secrets.GITLAB_URL }}
+          GITLAB_PROJECT_IDS:      ${{ secrets.GITLAB_PROJECT_IDS }}
+          GITLAB_GROUP_ID:         ${{ secrets.GITLAB_GROUP_ID }}
+          SLACK_BOT_TOKEN:         ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_ALERTS_CHANNEL:    ${{ secrets.SLACK_ALERTS_CHANNEL }}
+          SLACK_CONFIRMED_CHANNEL: ${{ secrets.SLACK_CONFIRMED_CHANNEL }}
+          NVD_API_KEY:             ${{ secrets.NVD_API_KEY }}
+          CHECK_HOURS_BACK:        "1"
+          MIN_SEVERITY:            "HIGH"
+          MAX_ALERTS_PER_RUN:      "20"
+        run: python3 vulnwatch.py
+
+      - name: Save state file (deduplication)
+        run: |
+          git config user.name  "vulnwatch-bot"
+          git config user.email "bot@vulnwatch"
+          git add vulnwatch_state.json || true
+          git diff --staged --quiet || git commit -m "chore: update vulnwatch state [skip ci]"
+          git push || true
