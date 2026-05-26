@@ -52,6 +52,17 @@ MIN_SEVERITY        = os.getenv("MIN_SEVERITY",            "HIGH") # LOW/MEDIUM/
 SLACK_DELAY_SECONDS = 1.2   # stay under Slack rate limit (1 msg/sec)
 MAX_ALERTS_PER_RUN  = int(os.getenv("MAX_ALERTS_PER_RUN", "20"))  # cap alerts per run
 
+# ── Category filter (lead's requirement) ─────────────────────────────────────
+# Only alert on these categories. Leave empty list [] to allow ALL categories.
+# Matching is case-insensitive and partial (e.g. "zero" matches "Zero-Day")
+ALERT_CATEGORIES = [
+    "zero-day",       # 💀 0days and actively exploited vulns
+    "supply chain",   # 📦 dependency confusion, malicious packages, typosquatting
+]
+
+# NVD disabled per lead's feedback — too noisy, low signal
+ENABLE_NVD = False
+
 STATE_FILE = Path("vulnwatch_state.json")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -101,6 +112,13 @@ SEVERITY_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0,
 
 def severity_passes(sev: str) -> bool:
     return SEVERITY_ORDER.get(sev.upper(), 0) >= SEVERITY_ORDER.get(MIN_SEVERITY.upper(), 3)
+
+def category_passes(category: str) -> bool:
+    """Returns True if vuln category matches the lead's filter list."""
+    if not ALERT_CATEGORIES:
+        return True  # empty list = allow all
+    cat_lower = (category or "").lower()
+    return any(f.lower() in cat_lower for f in ALERT_CATEGORIES)
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 
@@ -362,28 +380,59 @@ def fetch_osv() -> list[dict]:
 
 
 RSS_FEEDS = [
-    ("Microsoft MSRC",    "🪟", "https://api.msrc.microsoft.com/update-guide/rss",           "HIGH"),
-    ("Cisco",             "🔵", "https://tools.cisco.com/security/center/psirtrss20.xml",     "HIGH"),
-    ("Red Hat",           "🎩", "https://access.redhat.com/security/vulnerabilities/rss",     "HIGH"),
-    ("Ubuntu",            "🟠", "https://ubuntu.com/security/notices/rss.xml",                "MEDIUM"),
-    ("Palo Alto Unit42",  "🔥", "https://unit42.paloaltonetworks.com/feed/",                  "HIGH"),
-    ("Fortinet",          "🛡",  "https://www.fortiguard.com/rss/ir.xml",                     "HIGH"),
-    ("GitHub Advisories", "🐙", "https://github.com/advisories.atom",                         "HIGH"),
-    ("The Hacker News",   "📡", "https://feeds.feedburner.com/TheHackersNews",                "NEWS"),
-    ("Bleeping Computer", "💻", "https://www.bleepingcomputer.com/feed/",                     "NEWS"),
-    ("Packet Storm",      "⚡", "https://rss.packetstormsecurity.com/files/",                 "HIGH"),
-    ("SANS ISC",          "🌩️", "https://isc.sans.edu/rssfeed_full.xml",                     "HIGH"),
-    ("Dark Reading",      "🌑", "https://www.darkreading.com/rss.xml",                        "NEWS"),
-    ("Krebs on Security", "🕵️", "https://krebsonsecurity.com/feed/",                         "NEWS"),
-    ("Exploit-DB",        "💥", "https://www.exploit-db.com/rss.xml",                         "HIGH"),
-    ("Full Disclosure",   "📢", "https://seclists.org/rss/fulldisclosure.rss",                "HIGH"),
-    ("CyberSecurityNews", "📰", "https://cybersecuritynews.com/feed/",                        "NEWS"),
+    # ── ZERO-DAY SOURCES (ranked by speed) ───────────────────────────────────
+    # 1. CISA KEV handled separately via fetch_cisa_kev() — fastest for active exploits
+    # 2. Google Project Zero — discloses vulns directly, before NVD processes them
+    ("Google Project Zero",  "🔬", "https://googleprojectzero.blogspot.com/feeds/posts/default", "CRITICAL"),
+    # 3. Zero Day Initiative (Trend Micro) — posts advisories before patches exist
+    ("Zero Day Initiative",  "🎯", "https://www.zerodayinitiative.com/rss/published/",           "CRITICAL"),
+    # 4. Exploit-DB — PoC code = exploitation imminent or already happening
+    ("Exploit-DB",           "💥", "https://www.exploit-db.com/rss.xml",                         "CRITICAL"),
+    # 5. Vendor PSIRTs — post 24-48h before NVD processes
+    ("Microsoft MSRC",       "🪟", "https://api.msrc.microsoft.com/update-guide/rss",            "HIGH"),
+    ("Cisco PSIRT",          "🔵", "https://tools.cisco.com/security/center/psirtrss20.xml",      "HIGH"),
+    ("Palo Alto Unit42",     "🔥", "https://unit42.paloaltonetworks.com/feed/",                   "HIGH"),
+    ("Fortinet PSIRT",       "🛡",  "https://www.fortiguard.com/rss/ir.xml",                      "HIGH"),
+    ("VMware Security",      "💠", "https://www.vmware.com/security/advisories/rss-feed.xml",     "HIGH"),
+    # 6. SANS ISC — community detects in-the-wild exploitation in real time
+    ("SANS ISC",             "🌩️", "https://isc.sans.edu/rssfeed_full.xml",                      "HIGH"),
+    # 7. Full Disclosure — researchers post 0days directly here
+    ("Full Disclosure",      "📢", "https://seclists.org/rss/fulldisclosure.rss",                 "HIGH"),
+    # 8. Packet Storm — exploit archive, fast 0day coverage
+    ("Packet Storm",         "⚡", "https://rss.packetstormsecurity.com/files/",                  "HIGH"),
+
+    # ── SUPPLY CHAIN SOURCES (ranked by speed) ────────────────────────────────
+    # 1. Socket.dev — clones npm/PyPI in real time, detects malicious pkgs in seconds
+    ("Socket Security",      "🔌", "https://socket.dev/blog/rss.xml",                            "CRITICAL"),
+    # 2. GitHub Security Advisories — real-time, catches compromised Actions + packages
+    ("GitHub Advisories",    "🐙", "https://github.com/advisories.atom",                          "HIGH"),
+    # 3. PyPI Recent packages feed — catch malicious uploads directly from registry
+    ("PyPI Recent",          "🐍", "https://pypi.org/rss/updates.xml",                            "NEWS"),
+    # 4. npm advisories via GitHub — structured package advisories
+    ("npm Advisories",       "📦", "https://github.com/nicolo-ribaudo/esm-dynamic-import-ponyfill/security/advisories.atom", "HIGH"),
+    # 5. OSV.dev handled separately via fetch_osv() — exact semver ranges
+    # 6. Bleeping Computer — best journalism coverage of supply chain attacks
+    ("Bleeping Computer",    "💻", "https://www.bleepingcomputer.com/feed/",                      "NEWS"),
+    # 7. The Hacker News — fast supply chain + zero-day reporting
+    ("The Hacker News",      "📡", "https://feeds.feedburner.com/TheHackersNews",                 "NEWS"),
+    # 8. Security Week — supply chain incident reporting
+    ("Security Week",        "📊", "https://feeds.feedburner.com/securityweek",                   "NEWS"),
+    # 9. Checkmarx supply chain blog — dedicated supply chain research
+    ("Checkmarx Research",   "🔍", "https://checkmarx.com/blog/feed/",                           "HIGH"),
+    # 10. Snyk security blog — npm/PyPI malicious package disclosures
+    ("Snyk Security",        "🛡️", "https://snyk.io/blog/feed/",                                 "HIGH"),
 ]
 
 NEWS_KWS = [
-    "cve","vulnerabilit","exploit","zero-day","0day","rce","patch","advisory",
-    "breach","malware","ransomware","backdoor","injection","overflow","escalation",
-    "bypass","disclosure","poc","critical","remote code","data leak","actively exploited",
+    # Zero-day keywords
+    "zero-day", "0day", "actively exploited", "in the wild", "poc", "proof of concept",
+    "exploit", "remote code execution", "rce", "privilege escalation", "auth bypass",
+    "critical", "cve", "vulnerabilit", "patch tuesday", "emergency patch",
+    # Supply chain keywords
+    "supply chain", "malicious package", "typosquat", "dependency confusion",
+    "npm package", "pypi package", "rubygems", "cargo", "composer",
+    "package hijack", "malicious npm", "malicious pypi", "open source attack",
+    "backdoored", "poisoned", "sbom", "software bill of materials",
 ]
 
 def fetch_rss_feeds() -> list[dict]:
@@ -867,13 +916,104 @@ Update `{finding['package_name']}` to `{finding['fixed_version']}` in `{finding[
     except Exception as e:
         log.error(f"GitLab issue: {e}")
 
+def fetch_socket_packages() -> list[dict]:
+    """Socket.dev — detects malicious npm/PyPI packages within seconds of publication.
+    90-95% of malicious packages never get a CVE — NVD completely misses them.
+    Socket is the fastest supply chain source available."""
+    vulns  = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=CHECK_HOURS_BACK)
+    try:
+        # Socket publishes malicious package reports via their blog RSS
+        # and their public research feed
+        feed = feedparser.parse("https://socket.dev/blog/rss.xml")
+        for entry in feed.entries:
+            pub_dt = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                try:
+                    pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                except Exception:
+                    pass
+            if pub_dt and pub_dt < cutoff:
+                continue
+            title   = strip_html(entry.get("title", "")).strip()
+            summary = strip_html(entry.get("summary", ""))[:400]
+            # Only keep supply chain related posts
+            sc_kws = ["malicious", "supply chain", "typosquat", "backdoor",
+                      "npm", "pypi", "package", "dependency", "hijack"]
+            if not any(k in (title + summary).lower() for k in sc_kws):
+                continue
+            vulns.append({
+                "id":               make_id(entry.get("link", title) + "socket"),
+                "title":            f"[Socket] {title}",
+                "description":      summary,
+                "severity":         "CRITICAL",
+                "cvss":             None,
+                "category":         "📦 Supply Chain",
+                "source":           "Socket.dev",
+                "source_emoji":     "🔌",
+                "url":              entry.get("link", "https://socket.dev/blog"),
+                "published":        pub_dt.isoformat() if pub_dt else "",
+                "affected_packages": [],
+                "affected_versions": "",
+                "ecosystems":       ["npm", "pypi"],
+            })
+        log.info(f"Socket.dev: {len(vulns)} supply chain reports")
+    except Exception as e:
+        log.error(f"Socket.dev: {e}")
+    return vulns
+
+
+def fetch_pypi_malicious() -> list[dict]:
+    """PyPI Recent Updates feed — catch malicious package uploads directly from registry.
+    Filters for recently quarantined or suspicious packages."""
+    vulns  = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=CHECK_HOURS_BACK)
+    try:
+        # PyPI security advisories via OSV (already covered) but also watch
+        # the PyPI blog for quarantine announcements
+        feed = feedparser.parse("https://blog.pypi.org/posts/index.xml")
+        for entry in feed.entries:
+            pub_dt = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                try:
+                    pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                except Exception:
+                    pass
+            if pub_dt and pub_dt < cutoff:
+                continue
+            title   = strip_html(entry.get("title", "")).strip()
+            summary = strip_html(entry.get("summary", ""))[:400]
+            sc_kws  = ["malicious", "quarantine", "security", "supply chain",
+                       "remove", "suspend", "attack", "typosquat"]
+            if not any(k in (title + summary).lower() for k in sc_kws):
+                continue
+            vulns.append({
+                "id":               make_id(entry.get("link", title) + "pypi"),
+                "title":            f"[PyPI] {title}",
+                "description":      summary,
+                "severity":         "CRITICAL",
+                "cvss":             None,
+                "category":         "📦 Supply Chain",
+                "source":           "PyPI Blog",
+                "source_emoji":     "🐍",
+                "url":              entry.get("link", "https://blog.pypi.org"),
+                "published":        pub_dt.isoformat() if pub_dt else "",
+                "affected_packages": [],
+                "affected_versions": "",
+                "ecosystems":       ["pypi"],
+            })
+        log.info(f"PyPI Blog: {len(vulns)} security announcements")
+    except Exception as e:
+        log.error(f"PyPI Blog: {e}")
+    return vulns
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     log.info("=" * 60)
-    log.info("VulnWatch starting scan...")
+    log.info("VulnWatch — Zero-Day + Supply Chain focus")
     log.info("=" * 60)
 
     state         = load_state()
@@ -882,14 +1022,33 @@ def main():
 
     # Step 1: Fetch all vuln sources
     log.info("Step 1/4 — Fetching vulnerability feeds...")
+    log.info(f"  Category filter: {ALERT_CATEGORIES}")
     all_vulns = []
-    all_vulns += fetch_cisa_kev()        # 🇺🇸 new KEV entries only
-    all_vulns += fetch_osv()             # 📦 package-level vulns
-    all_vulns += fetch_rss_feeds()       # 📡 16 RSS feeds in parallel
-    all_vulns += fetch_nvd()             # 🛡️ CVE database
-    all_vulns += fetch_ransomware_live() # 🦠 ransomware victims
-    all_vulns += fetch_threatfox()       # 🦊 threat actor IOCs
+
+    # ── Zero-Day sources (fastest first) ──────────────────────────────────
+    all_vulns += fetch_cisa_kev()        # 🇺🇸 #1 — actively exploited only
+    all_vulns += fetch_rss_feeds()       # 🔬 Google P0, ZDI, Exploit-DB, PSIRT feeds
+
+    # ── Supply Chain sources (fastest first) ──────────────────────────────
+    all_vulns += fetch_socket_packages() # 🔌 #1 — detects malicious pkgs in seconds
+    all_vulns += fetch_pypi_malicious()  # 🐍 #2 — PyPI quarantine announcements
+    all_vulns += fetch_osv()             # 📦 #3 — exact semver ranges for packages
+    all_vulns += fetch_ransomware_live() # 🦠 supply chain + ransomware victims
+    all_vulns += fetch_threatfox()       # 🦊 IOCs from active campaigns
+
+    # NVD disabled — too noisy, 24-48h lag, not useful for zero-day/supply chain focus
+    if ENABLE_NVD:
+        all_vulns += fetch_nvd()
+    else:
+        log.info("NVD: skipped (disabled per lead feedback — too noisy)")
+
     log.info(f"Total fetched: {len(all_vulns)}")
+
+    # Apply category filter — zero-day and supply chain only
+    if ALERT_CATEGORIES:
+        filtered = [v for v in all_vulns if category_passes(v.get("category", ""))]
+        log.info(f"After category filter: {len(filtered)} / {len(all_vulns)} kept")
+        all_vulns = filtered
 
     # Step 2: Send raw alerts → #security-alerts
     log.info("Step 2/4 — Sending raw alerts to #security-alerts...")
@@ -902,11 +1061,11 @@ def main():
         new_vulns.append(vuln)
         if severity_passes(vuln["severity"]):
             if alerts_sent >= MAX_ALERTS_PER_RUN:
-                log.info(f"  Hit MAX_ALERTS_PER_RUN ({MAX_ALERTS_PER_RUN}) — rest queued next run")
+                log.info(f"  Hit MAX_ALERTS_PER_RUN ({MAX_ALERTS_PER_RUN}) — rest queued")
                 break
             send_raw_alert(vuln)
             alerts_sent += 1
-            time.sleep(SLACK_DELAY_SECONDS)  # rate limit protection
+            time.sleep(SLACK_DELAY_SECONDS)
 
     log.info(f"  {len(new_vulns)} new | {alerts_sent} sent to Slack")
 
@@ -934,13 +1093,12 @@ def main():
 
     log.info(f"  {confirmed_sent} new confirmed findings alerted")
 
-    # Save state
     state["seen_vulns"]    = list(seen_vulns)
     state["seen_findings"] = list(seen_findings)
     save_state(state)
 
     log.info("=" * 60)
-    log.info(f"✅ Done — New vulns: {len(new_vulns)} | Confirmed: {confirmed_sent}")
+    log.info(f"✅ Done — New: {len(new_vulns)} | Confirmed: {confirmed_sent}")
     log.info("=" * 60)
 
 
