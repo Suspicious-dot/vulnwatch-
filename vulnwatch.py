@@ -36,12 +36,12 @@ from slack_sdk.errors import SlackApiError
 #  CONFIG — fill these in
 # ══════════════════════════════════════════════════════════════════════════════
 
-GITLAB_TOKEN       = os.getenv("GITLAB_TOKEN",       "glpat-xxxx")
+GITLAB_TOKEN       = os.getenv("GITLAB_TOKEN",       "")
 GITLAB_URL         = os.getenv("GITLAB_URL",         "https://gitlab.com")
 GITLAB_GROUP_ID    = os.getenv("GITLAB_GROUP_ID",    "")
 GITLAB_PROJECT_IDS = os.getenv("GITLAB_PROJECT_IDS", "")  # comma-separated IDs
 
-SLACK_BOT_TOKEN         = os.getenv("SLACK_BOT_TOKEN",         "xoxb-xxxx")
+SLACK_BOT_TOKEN         = os.getenv("SLACK_BOT_TOKEN",         "")
 SLACK_ALERTS_CHANNEL    = os.getenv("SLACK_ALERTS_CHANNEL",    "#security-alerts")
 SLACK_CONFIRMED_CHANNEL = os.getenv("SLACK_CONFIRMED_CHANNEL", "#security-confirmed")
 
