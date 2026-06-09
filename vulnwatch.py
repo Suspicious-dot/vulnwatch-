@@ -36,12 +36,12 @@ from slack_sdk.errors import SlackApiError
 #  CONFIG — fill these in
 # ══════════════════════════════════════════════════════════════════════════════
 
-GITLAB_TOKEN       = os.getenv("GITLAB_TOKEN",       "")
+GITLAB_TOKEN       = os.getenv("GITLAB_TOKEN",       "glpat-xxxx")
 GITLAB_URL         = os.getenv("GITLAB_URL",         "https://gitlab.com")
 GITLAB_GROUP_ID    = os.getenv("GITLAB_GROUP_ID",    "")
 GITLAB_PROJECT_IDS = os.getenv("GITLAB_PROJECT_IDS", "")  # comma-separated IDs
 
-SLACK_BOT_TOKEN         = os.getenv("SLACK_BOT_TOKEN",         "")
+SLACK_BOT_TOKEN         = os.getenv("SLACK_BOT_TOKEN",         "xoxb-xxxx")
 SLACK_ALERTS_CHANNEL    = os.getenv("SLACK_ALERTS_CHANNEL",    "#security-alerts")
 SLACK_CONFIRMED_CHANNEL = os.getenv("SLACK_CONFIRMED_CHANNEL", "#security-confirmed")
 
@@ -60,8 +60,10 @@ ALERT_CATEGORIES = [
     "supply chain",   # 📦 dependency confusion, malicious packages, typosquatting
 ]
 
-# NVD disabled per lead's feedback — too noisy, low signal
-ENABLE_NVD = False
+# ── Source toggles — disabled = not fetched at all ────────────────────────────
+ENABLE_NVD             = False  # too noisy, 24-48h lag — disabled per lead
+ENABLE_RANSOMWARE_LIVE = False  # ransomware victims — not zero-day or supply chain
+ENABLE_THREATFOX       = False  # IOCs — not zero-day or supply chain
 
 STATE_FILE = Path("vulnwatch_state.json")
 
@@ -148,12 +150,20 @@ def parse_dt(raw: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 CATEGORIES = [
-    ("💀 Zero-Day",       ["0day","zero-day","zero day","actively exploited","in the wild","poc"]),
-    ("🌐 Web / AppSec",   ["xss","csrf","sql injection","sqli","ssrf","rce","remote code",
+    # Zero-Day — expanded to catch CVE entries that don't say "zero-day" explicitly
+    ("💀 Zero-Day",       ["0day", "zero-day", "zero day", "actively exploited",
+                           "in the wild", "poc", "proof of concept",
+                           "exploit available", "exploited in wild",
+                           "known exploited", "cisa kev", "emergency patch",
+                           "patch tuesday", "out-of-bounds", "use after free",
+                           "heap overflow", "stack overflow", "buffer overflow",
+                           "remote code execution", "rce", "unauthenticated",
+                           "privilege escalation", "auth bypass", "code execution"]),
+    ("🌐 Web / AppSec",   ["xss","csrf","sql injection","sqli","ssrf",
                             "deserialization","path traversal","injection","oauth","jwt",
-                            "auth bypass","idor","xxe","open redirect"]),
+                            "idor","xxe","open redirect"]),
     ("🏗️ Infra",          ["linux","windows server","active directory","ldap","kerberos","rdp",
-                            "ssh","privilege escalation","kernel","driver","firmware","docker",
+                            "ssh","kernel","driver","firmware","docker",
                             "kubernetes","k8s","hypervisor","vmware","container escape"]),
     ("☁️ Cloud",          ["aws","azure","gcp","google cloud","s3 bucket","iam","serverless",
                             "cloud misconfiguration","eks","aks","gke","azure ad","okta","entra"]),
@@ -162,8 +172,14 @@ CATEGORIES = [
     ("🦠 Malware",        ["ransomware","malware","trojan","backdoor","rootkit","botnet",
                             "infostealer","cryptominer","c2","command and control","lockbit",
                             "alphv","cl0p","blackbasta"]),
-    ("📦 Supply Chain",   ["supply chain","dependency","npm package","pypi","rubygems","maven",
-                            "typosquat","dependency confusion","malicious package","sbom"]),
+    # Supply Chain — expanded to catch more package ecosystem attacks
+    ("📦 Supply Chain",   ["supply chain", "dependency confusion", "typosquat",
+                           "malicious package", "malicious npm", "malicious pypi",
+                           "npm package", "pypi package", "rubygems", "maven",
+                           "cargo package", "composer package", "package hijack",
+                           "compromised package", "poisoned package", "sbom",
+                           "open source attack", "registry attack", "maintainer",
+                           "backdoored package", "malicious dependency"]),
     ("🔐 Crypto / Auth",  ["tls","ssl","certificate","openssl","encryption","weak cipher",
                             "key exposure","mfa bypass","saml","password","credential"]),
     ("📱 Mobile",         ["android","ios","iphone","mobile","apk","webkit"]),
@@ -1022,33 +1038,42 @@ def main():
 
     # Step 1: Fetch all vuln sources
     log.info("Step 1/4 — Fetching vulnerability feeds...")
-    log.info(f"  Category filter: {ALERT_CATEGORIES}")
+    log.info(f"  Active filters: {ALERT_CATEGORIES}")
     all_vulns = []
 
-    # ── Zero-Day sources (fastest first) ──────────────────────────────────
-    all_vulns += fetch_cisa_kev()        # 🇺🇸 #1 — actively exploited only
-    all_vulns += fetch_rss_feeds()       # 🔬 Google P0, ZDI, Exploit-DB, PSIRT feeds
+    # ── Zero-Day sources (fastest first) ──────────────────────────────────────
+    all_vulns += fetch_cisa_kev()         # 🇺🇸 actively exploited only — zero noise
+    all_vulns += fetch_rss_feeds()        # 🔬 Google P0, ZDI, Exploit-DB, vendor PSIRTs
 
-    # ── Supply Chain sources (fastest first) ──────────────────────────────
-    all_vulns += fetch_socket_packages() # 🔌 #1 — detects malicious pkgs in seconds
-    all_vulns += fetch_pypi_malicious()  # 🐍 #2 — PyPI quarantine announcements
-    all_vulns += fetch_osv()             # 📦 #3 — exact semver ranges for packages
-    all_vulns += fetch_ransomware_live() # 🦠 supply chain + ransomware victims
-    all_vulns += fetch_threatfox()       # 🦊 IOCs from active campaigns
+    # ── Supply Chain sources (fastest first) ───────────────────────────────────
+    all_vulns += fetch_socket_packages()  # 🔌 detects malicious pkgs within seconds
+    all_vulns += fetch_pypi_malicious()   # 🐍 PyPI quarantine announcements
+    all_vulns += fetch_osv()              # 📦 exact semver ranges for packages
 
-    # NVD disabled — too noisy, 24-48h lag, not useful for zero-day/supply chain focus
+    # ── Disabled sources ────────────────────────────────────────────────────────
     if ENABLE_NVD:
         all_vulns += fetch_nvd()
     else:
-        log.info("NVD: skipped (disabled per lead feedback — too noisy)")
+        log.info("  NVD: skipped (ENABLE_NVD=False — too noisy)")
 
-    log.info(f"Total fetched: {len(all_vulns)}")
+    if ENABLE_RANSOMWARE_LIVE:
+        all_vulns += fetch_ransomware_live()
+    else:
+        log.info("  Ransomware.live: skipped (ENABLE_RANSOMWARE_LIVE=False)")
 
-    # Apply category filter — zero-day and supply chain only
+    if ENABLE_THREATFOX:
+        all_vulns += fetch_threatfox()
+    else:
+        log.info("  ThreatFox: skipped (ENABLE_THREATFOX=False)")
+
+    log.info(f"  Total fetched: {len(all_vulns)}")
+
+    # Apply category filter FIRST — drop everything not in ALERT_CATEGORIES
+    # This runs before dedup so state file never fills up with irrelevant vulns
     if ALERT_CATEGORIES:
-        filtered = [v for v in all_vulns if category_passes(v.get("category", ""))]
-        log.info(f"After category filter: {len(filtered)} / {len(all_vulns)} kept")
-        all_vulns = filtered
+        before = len(all_vulns)
+        all_vulns = [v for v in all_vulns if category_passes(v.get("category", ""))]
+        log.info(f"  After category filter: {len(all_vulns)} kept / {before} dropped")
 
     # Step 2: Send raw alerts → #security-alerts
     log.info("Step 2/4 — Sending raw alerts to #security-alerts...")
